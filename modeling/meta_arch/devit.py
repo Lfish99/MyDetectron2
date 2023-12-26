@@ -1,55 +1,102 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import math
-import random
-import logging
-import numpy as np
-from typing import Dict, List, Optional, Tuple
-from numpy.lib import pad
-import torch
-from torch import nn
-from torch.nn import functional as F
-from random import randint
-from torch.cuda.amp import autocast
-
-
-from detectron2.config import configurable, get_cfg
-from detectron2.data.detection_utils import convert_image_to_rgb
-from detectron2.structures import ImageList, Instances, Boxes
-from detectron2.utils.events import get_event_storage
-from detectron2.utils.logger import log_first_n
-
-from ..backbone import Backbone, build_backbone
-from ..postprocessing import detector_postprocess
-from ..proposal_generator import build_proposal_generator
-import warnings
-from detectron2.data.datasets.coco_zeroshot_categories import COCO_SEEN_CLS, \
-    COCO_UNSEEN_CLS, COCO_OVD_ALL_CLS
-from ..roi_heads import build_roi_heads
-from ..matcher import Matcher
 from .build import META_ARCH_REGISTRY
-
-
-from PIL import Image
-import copy
-from ..backbone.fpn import build_resnet_fpn_backbone
-from detectron2.utils.comm import gather_tensors, MILCrossEntropy
-
+from detectron2.config import configurable, get_cfg
 from detectron2.layers.roi_align import ROIAlign
-from torchvision.ops.boxes import box_area, box_iou
-
-from torchvision.ops import sigmoid_focal_loss
-
-from detectron2.modeling.roi_heads.fast_rcnn import fast_rcnn_inference
 from detectron2.modeling.box_regression import Box2BoxTransform
-from detectron2.structures import Boxes, Instances
-from fvcore.nn import giou_loss, smooth_l1_loss
 from detectron2.structures.masks import PolygonMasks
-
-from lib.dinov2.layers.block import Block
+from detectron2.utils.events import get_event_storage
+from detectron2.modeling.roi_heads.fast_rcnn import fast_rcnn_inference
+from ..backbone import Backbone, build_backbone
+from ..proposal_generator import build_proposal_generator
+from ..matcher import Matcher
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+from fvcore.nn import smooth_l1_loss
+from torchvision.ops import sigmoid_focal_loss
+from torch.cuda.amp import autocast
+from torchvision.ops.boxes import box_area, box_iou
+from typing import Dict, List, Optional, Tuple
+import torch
+from torch import nn
+from torch.nn import functional as F
+import numpy as np
+import warnings
+import math
+import random
 
+
+# 17 class names in order, obtained from load_coco_json() function
+COCO_UNSEEN_CLS = ['airplane', 'bus', 'cat', 'dog', 'cow', 'elephant', 'umbrella', \
+    'tie', 'snowboard', 'skateboard', 'cup', 'knife', 'cake', 'couch', 'keyboard', \
+    'sink', 'scissors']
+
+# 48 class names in order, obtained from load_coco_json() function
+COCO_SEEN_CLS = ['person', 'bicycle', 'car', 'motorcycle', 'train', 'truck', \
+    'boat', 'bench', 'bird', 'horse', 'sheep', 'bear', 'zebra', 'giraffe', \
+    'backpack', 'handbag', 'suitcase', 'frisbee', 'skis', 'kite', 'surfboard', \
+    'bottle', 'fork', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange', \
+    'broccoli', 'carrot', 'pizza', 'donut', 'chair', 'bed', 'toilet', 'tv', \
+    'laptop', 'mouse', 'remote', 'microwave', 'oven', 'toaster', \
+    'refrigerator', 'book', 'clock', 'vase', 'toothbrush']
+
+def distance_embed(x, temperature = 10000, num_pos_feats = 128, scale=10.0):
+    # x: [bs, n_dist]
+    x = x[..., None]
+    scale = 2 * math.pi * scale
+    dim_t = torch.arange(num_pos_feats)
+    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / num_pos_feats)
+    sin_x = x * scale / dim_t.to(x.device)
+    emb = torch.stack((sin_x[:, :, 0::2].sin(), sin_x[:, :, 1::2].cos()), dim=3).flatten(2)
+    return emb # [bs, n_dist, n_emb]
+
+def sigmoid_ce_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
+    ):
+    """
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    Returns:
+        Loss tensor
+    """
+    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+
+    return loss.mean(1).sum() / num_masks
+
+def dice_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
+    ):
+    """
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs = inputs.sigmoid()
+    inputs = inputs.flatten(1)
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss.sum() / num_masks
+
+def interpolate(seq, T, mode='linear', force=False):
+    # seq: B x C x L
+    if (seq.shape[-1] < T) or force:
+        return F.interpolate(seq, T, mode=mode) 
+    else:
+    #     # assume is sorted ascending order
+        return seq[:, :, -T:]
+    
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
     Generalized IoU from https://giou.stanford.edu/
@@ -79,15 +126,67 @@ def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
 
     return iou - (area - union) / (area + 1e-6)
 
+def box_cxcywh_to_xyxy(bbox) -> torch.Tensor:
+    """Convert bbox coordinates from (cx, cy, w, h) to (x1, y1, x2, y2)
 
-def interpolate(seq, T, mode='linear', force=False):
-    # seq: B x C x L
-    if (seq.shape[-1] < T) or force:
-        return F.interpolate(seq, T, mode=mode) 
-    else:
-    #     # assume is sorted ascending order
-        return seq[:, :, -T:]
+    Args:
+        bbox (torch.Tensor): Shape (n, 4) for bboxes.
 
+    Returns:
+        torch.Tensor: Converted bboxes.
+    """
+    cx, cy, w, h = bbox.unbind(-1)
+    new_bbox = [(cx - 0.5 * w), (cy - 0.5 * h), (cx + 0.5 * w), (cy + 0.5 * h)]
+    return torch.stack(new_bbox, dim=-1)
+
+def _log_classification_stats(pred_logits, gt_classes):
+    num_instances = gt_classes.numel()
+    if num_instances == 0:
+        return
+    pred_classes = pred_logits.argmax(dim=1)
+    bg_class_ind = pred_logits.shape[1] - 1
+
+    fg_inds = (gt_classes >= 0) & (gt_classes < bg_class_ind)
+    num_fg = fg_inds.nonzero().numel()
+    fg_gt_classes = gt_classes[fg_inds]
+    fg_pred_classes = pred_classes[fg_inds]
+
+    num_false_negative = (fg_pred_classes == bg_class_ind).nonzero().numel()
+    num_accurate = (pred_classes == gt_classes).nonzero().numel()
+    fg_num_accurate = (fg_pred_classes == fg_gt_classes).nonzero().numel()
+
+    try:
+        storage = get_event_storage()
+        storage.put_scalar(f"cls_acc", num_accurate / num_instances)
+        if num_fg > 0:
+            storage.put_scalar(f"fg_cls_acc", fg_num_accurate / num_fg)
+            storage.put_scalar(f"false_neg_ratio", num_false_negative / num_fg)
+    except:
+        pass
+
+def focal_loss(inputs, targets, gamma=0.5, reduction="mean", bg_weight=0.2, num_classes=None):
+    """Inspired by RetinaNet implementation"""
+    if targets.numel() == 0 and reduction == "mean":
+        return input.sum() * 0.0  # connect the gradient
+    
+    # focal scaling
+    ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+    p = F.softmax(inputs, dim=-1)
+    p_t = p[torch.arange(p.size(0)).to(p.device), targets]  # get prob of target class
+    p_t = torch.clamp(p_t, 1e-7, 1-1e-7) # prevent NaN
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    # bg loss weight
+    if bg_weight >= 0:
+        assert num_classes is not None
+        loss_weight = torch.ones(loss.size(0)).to(p.device)
+        loss_weight[targets == num_classes] = bg_weight
+        loss = loss * loss_weight
+
+    if reduction == "mean":
+        loss = loss.mean()
+
+    return loss
 
 class PropagateNet(nn.Module):
     
@@ -157,257 +256,42 @@ class PropagateNet(nn.Module):
             results = results[-1]
         return results
 
-
-def dice_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
-
-def sigmoid_ce_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-
-    return loss.mean(1).sum() / num_masks
-
-
-
-def _log_classification_stats(pred_logits, gt_classes):
-    num_instances = gt_classes.numel()
-    if num_instances == 0:
-        return
-    pred_classes = pred_logits.argmax(dim=1)
-    bg_class_ind = pred_logits.shape[1] - 1
-
-    fg_inds = (gt_classes >= 0) & (gt_classes < bg_class_ind)
-    num_fg = fg_inds.nonzero().numel()
-    fg_gt_classes = gt_classes[fg_inds]
-    fg_pred_classes = pred_classes[fg_inds]
-
-    num_false_negative = (fg_pred_classes == bg_class_ind).nonzero().numel()
-    num_accurate = (pred_classes == gt_classes).nonzero().numel()
-    fg_num_accurate = (fg_pred_classes == fg_gt_classes).nonzero().numel()
-
-    try:
-        storage = get_event_storage()
-        storage.put_scalar(f"cls_acc", num_accurate / num_instances)
-        if num_fg > 0:
-            storage.put_scalar(f"fg_cls_acc", fg_num_accurate / num_fg)
-            storage.put_scalar(f"false_neg_ratio", num_false_negative / num_fg)
-    except:
-        pass
-
-
-def focal_loss(inputs, targets, gamma=0.5, reduction="mean", bg_weight=0.2, num_classes=None):
-    """Inspired by RetinaNet implementation"""
-    if targets.numel() == 0 and reduction == "mean":
-        return input.sum() * 0.0  # connect the gradient
-    
-    # focal scaling
-    ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-    p = F.softmax(inputs, dim=-1)
-    p_t = p[torch.arange(p.size(0)).to(p.device), targets]  # get prob of target class
-    p_t = torch.clamp(p_t, 1e-7, 1-1e-7) # prevent NaN
-    loss = ce_loss * ((1 - p_t) ** gamma)
-
-    # bg loss weight
-    if bg_weight >= 0:
-        assert num_classes is not None
-        loss_weight = torch.ones(loss.size(0)).to(p.device)
-        loss_weight[targets == num_classes] = bg_weight
-        loss = loss * loss_weight
-
-    if reduction == "mean":
-        loss = loss.mean()
-
-    return loss
-
-
-def distance_embed(x, temperature = 10000, num_pos_feats = 128, scale=10.0):
-    # x: [bs, n_dist]
-    x = x[..., None]
-    scale = 2 * math.pi * scale
-    dim_t = torch.arange(num_pos_feats)
-    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / num_pos_feats)
-    sin_x = x * scale / dim_t.to(x.device)
-    emb = torch.stack((sin_x[:, :, 0::2].sin(), sin_x[:, :, 1::2].cos()), dim=3).flatten(2)
-    return emb # [bs, n_dist, n_emb]
-
-
-################################################################################################################
-
-def box_cxcywh_to_xyxy(bbox) -> torch.Tensor:
-    """Convert bbox coordinates from (cx, cy, w, h) to (x1, y1, x2, y2)
-
-    Args:
-        bbox (torch.Tensor): Shape (n, 4) for bboxes.
-
-    Returns:
-        torch.Tensor: Converted bboxes.
-    """
-    cx, cy, w, h = bbox.unbind(-1)
-    new_bbox = [(cx - 0.5 * w), (cy - 0.5 * h), (cx + 0.5 * w), (cy + 0.5 * h)]
-    return torch.stack(new_bbox, dim=-1)
-
-
-def box_xyxy_to_cxcywh(bbox) -> torch.Tensor:
-    """Convert bbox coordinates from (x1, y1, x2, y2) to (cx, cy, w, h)
-
-    Args:
-        bbox (torch.Tensor): Shape (n, 4) for bboxes.
-
-    Returns:
-        torch.Tensor: Converted bboxes.
-    """
-    x0, y0, x1, y1 = bbox.unbind(-1)
-    new_bbox = [(x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0), (y1 - y0)]
-    return torch.stack(new_bbox, dim=-1)
-
-def elementwise_box_iou(boxes1, boxes2) -> Tuple[torch.Tensor]:
-    """Modified from ``torchvision.ops.box_iou``
-
-    Return both intersection-over-union (Jaccard index) and union between
-    two sets of boxes.
-
-    Args:
-        boxes1: (torch.Tensor[N, 4]): first set of boxes
-        boxes2: (torch.Tensor[M, 4]): second set of boxes
-
-    Returns:
-        Tuple: A tuple of NxM matrix, with shape `(torch.Tensor[N, M], torch.Tensor[N, M])`,
-        containing the pairwise IoU and union values
-        for every element in boxes1 and boxes2.
-    """
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-
-    lt = torch.max(boxes1[:, :2], boxes2[:, :2])  # [N,2]
-    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
-
-    wh = (rb - lt).clamp(min=0)  # [N,2]
-    inter = wh[:, 0] * wh[:,1]  # [N,M]
-
-    union = area1 + area2 - inter
-    iou = inter / (union + 1e-6)
-    return iou, union
-
-
 @META_ARCH_REGISTRY.register()
 class OpenSetDetectorWithExamples(nn.Module):
 
-    @property
-    def device(self):
-        return self.pixel_mean.device
-
-    def offline_preprocess_image(self, batched_inputs: List[Dict[str, torch.Tensor]]):
-        """
-        Normalize, pad and batch the input images. Use detectron2 default processing (pixel mean & std).
-        Note: Due to FPN size_divisibility, images are padded by right/bottom border. So FPN is consistent with C4 and GT boxes.
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        if (self.input_format == 'RGB' and self.offline_input_format == 'BGR') or \
-            (self.input_format == 'BGR' and self.offline_input_format == 'RGB'):
-            images = [x[[2,1,0],:,:] for x in images]
-        if self.offline_div_pixel:
-            images = [((x / 255.0) - self.offline_pixel_mean) / self.offline_pixel_std for x in images]
-        else:
-            images = [(x - self.offline_pixel_mean) / self.offline_pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.offline_backbone.size_divisibility)
-        return images
-
-    def preprocess_image(self, batched_inputs: List[Dict[str, torch.Tensor]]):
-        """
-        Normalize, pad and batch the input images. Use CLIP default processing (pixel mean & std).
-        Note: Due to FPN size_divisibility, images are padded by right/bottom border. So FPN is consistent with C4 and GT boxes.
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        if self.div_pixel:
-            images = [((x / 255.0) - self.pixel_mean) / self.pixel_std for x in images]
-        else:
-            images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.backbone.size_divisibility)
-        return images
-
-    @staticmethod
-    def _postprocess(instances, batched_inputs: List[Dict[str, torch.Tensor]]):
-        """
-        Rescale the output instances to the target size.
-        """
-        # note: private function; subject to changes
-        processed_results = []
-        for results_per_image, input_per_image in zip(
-            instances, batched_inputs):
-            height = input_per_image["height"]  # original image size, before resizing
-            width = input_per_image["width"]  # original image size, before resizing
-            r = detector_postprocess(results_per_image, height, width)
-            processed_results.append({"instances": r})
-        return processed_results
-
     @configurable
-    def __init__(self,
-                offline_backbone: Backbone,
+    def __init__(self, 
                 backbone: Backbone,
+                offline_backbone: Backbone,
                 offline_proposal_generator: nn.Module, 
-
                 pixel_mean: Tuple[float],
                 pixel_std: Tuple[float],
-
                 offline_pixel_mean: Tuple[float],
                 offline_pixel_std: Tuple[float],
                 offline_input_format: Optional[str] = None,
 
-                class_prototypes_file="",
+                class_prototypes_file="",   # 感觉可以把prototypes路径给传进去
                 bg_prototypes_file="",
+                proposal_matcher = None,
+                box2box_transform=None,
+                seen_cids = [],
+                all_cids = [],
+                mask_cids = [],
+
+                bg_cls_weight=0.2,
                 roialign_size=7,
                 box_noise_scale=1.0,
-                proposal_matcher = None,
-
-                box2box_transform=None,
+                T_length=128,
+                num_cls_layers=3,
                 smooth_l1_beta=0.0,
                 test_score_thresh=0.001,
                 test_nms_thresh=0.5,
                 test_topk_per_image=100,
-                cls_temp=0.1,
-                
+                cls_temp=0.1,              
                 num_sample_class=-1,
-                seen_cids = [],
-                all_cids = [],
-                mask_cids = [],
-                T_length=128,
-                
-                bg_cls_weight=0.2,
                 batch_size_per_image=128,
                 pos_ratio=0.25,
                 mult_rpn_score=False,
-                num_cls_layers=3,
                 use_one_shot= False,
                 one_shot_reference= '',
                 only_train_mask=True,
@@ -682,8 +566,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             if self.only_train_mask:
                 self.turn_off_box_training(force=True)
                 self.turn_off_cls_training(force=True)
-            
-    
+ 
     def turn_off_cls_training(self, force=False):
         self._turn_off_modules([
             self.fc_intra_class,
@@ -693,7 +576,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             self.bg_cnn,
             self.fc_bg_class
         ], force)
-
+    
     def turn_off_box_training(self, force=False):
         self._turn_off_modules([
             self.reg_intra_dist_emb,
@@ -808,39 +691,6 @@ class OpenSetDetectorWithExamples(nn.Module):
             
             "vit_feat_name": vit_feat_name
         }
-    
-    def prepare_noisy_boxes(self, gt_boxes, image_shape):
-        noisy_boxes = []
-
-        H, W = image_shape[2:]
-        H, W = float(H), float(W)
-
-        for box in gt_boxes:
-            box = box.repeat(5, 1) # duplicate more noisy boxes
-            box_ccwh = box_xyxy_to_cxcywh(box) 
-
-            diff = torch.zeros_like(box_ccwh)
-            diff[:, :2] = box_ccwh[:, 2:] / 2
-            diff[:, 2:] = box_ccwh[:, 2:] / 2
-
-            rand_sign = (
-                torch.randint_like(box_ccwh, low=0, high=2, dtype=torch.float32) * 2.0 - 1.0
-            ) 
-            rand_part = torch.rand_like(box_ccwh) * rand_sign
-            box_ccwh = box_ccwh + torch.mul(rand_part, diff).cuda() * self.box_noise_scale
-
-            noisy_box = box_cxcywh_to_xyxy(box_ccwh)
-
-            noisy_box[:, 0].clamp_(min=0.0, max=W)
-            noisy_box[:, 2].clamp_(min=0.0, max=W)
-            noisy_box[:, 1].clamp_(min=0.0, max=H)
-            noisy_box[:, 3].clamp_(min=0.0, max=H)
-
-            noisy_boxes.append(noisy_box)
-
-        return noisy_boxes
-    
-    
     def mask_forward(self, features, boxes, class_labels, class_weights, gt_masks=None, feature_dict=None):
         # all the boxes, labels here are foreground only
         # return pred mask when infernce, or dict of losses when training
